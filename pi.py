@@ -16,85 +16,45 @@ from hailo_platform import (
     HailoStreamInterface,
 )
 
-# === CONFIG ===
-HEF_PATH = "/home/pi/hailo-test/model/shapes224.hef"  # <-- metti qui il tuo .hef
-THRESH = 0.3  # soglia di confidenza
+HEF_PATH = "/home/pi/hailo-test/hef/shapes224.hef"
 
-# nomi delle classi nel tuo modello (ordina come in training)
-CLASS_NAMES = ['circle', 'square', 'triangle']
+# ordine delle classi = stesso ordine delle cartelle in data224/train
+CLASS_NAMES = [
+    "circle",
+    "square",
+    "triangle",
+]
 
 
-def decode_detections(dets_tensor, img_w, img_h, score_thresh=0.3):
+def classify(output_tensor):
     """
-    Assumo che dets_tensor sia shape (N, 6):
-      [x1_norm, y1_norm, x2_norm, y2_norm, score, class_id]
-    dove coordinate sono normalizzate in [0, 1].
-    Ritorna una lista di dict:
-      {"x1":..., "y1":..., "x2":..., "y2":..., "score":..., "label":...}
+    output_tensor shape: (3,)
+    Valori 0–255 -> normalizzati in [0,1] con /255.0
     """
-    if isinstance(dets_tensor, list):
-        dets_tensor = np.array(dets_tensor)
+    output_tensor = np.array(output_tensor).reshape(-1).astype(np.float32)
+    probs = output_tensor / 255.0
 
-    if dets_tensor.size == 0:
-        return []
+    class_id = int(np.argmax(probs))
+    score = float(probs[class_id])
 
-    dets_tensor = dets_tensor.reshape(-1, dets_tensor.shape[-1])
-    results = []
+    if 0 <= class_id < len(CLASS_NAMES):
+        label = CLASS_NAMES[class_id]
+    else:
+        label = f"id_{class_id}"
 
-    for det in dets_tensor:
-        # se non hai class_id (solo 5 valori) togli la parte del class_id
-        if det.shape[0] < 6:
-            # [x1n, y1n, x2n, y2n, score] senza class_id
-            x1n, y1n, x2n, y2n, score = det.astype(float)
-            class_id = 0
-        else:
-            x1n, y1n, x2n, y2n, score, class_id = det.astype(float)
-
-        if score < score_thresh:
-            continue
-
-        # da coordinate normalizzate a pixel
-        x1 = int(x1n * img_w)
-        y1 = int(y1n * img_h)
-        x2 = int(x2n * img_w)
-        y2 = int(y2n * img_h)
-
-        # clamp nei limiti immagine
-        x1 = max(0, min(x1, img_w - 1))
-        y1 = max(0, min(y1, img_h - 1))
-        x2 = max(0, min(x2, img_w - 1))
-        y2 = max(0, min(y2, img_h - 1))
-
-        class_id = int(class_id)
-        if 0 <= class_id < len(CLASS_NAMES):
-            label = CLASS_NAMES[class_id]
-        else:
-            label = f"id_{class_id}"
-
-        results.append(
-            {
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-                "score": score,
-                "label": label,
-            }
-        )
-
-    return results
+    return class_id, label, score, probs
 
 
 def main():
-    # --- Carico il modello e leggo la dimensione di input ---
+    # --- Modello Hailo ---
     hef = HEF(HEF_PATH)
     input_info = hef.get_input_vstream_infos()[0]
     in_h, in_w = input_info.shape[0], input_info.shape[1]
+    print("Input vstream info:", input_info)
     print(f"Input model size: {in_w}x{in_h}")
 
-    # --- Inizializzo la camera (Picamera2) ---
+    # --- Camera ---
     picam = Picamera2()
-
     video_config = picam.create_video_configuration(
         main={"size": (in_w, in_h), "format": "RGB888"}
     )
@@ -102,17 +62,17 @@ def main():
     picam.start()
     time.sleep(0.5)
 
-    # --- Trovo i device Hailo ---
+    # --- Dispositivi Hailo ---
     devices = Device.scan()
     if not devices:
-        raise RuntimeError("Nessun dispositivo Hailo trovato (Device.scan() vuoto)")
+        raise RuntimeError("Nessun dispositivo Hailo trovato")
     print("Dispositivi Hailo:", devices)
 
-    # --- Creo VDevice e configuro il network group ---
+    # --- VDevice + network group ---
     with VDevice(device_ids=devices) as target:
         cfg_params = ConfigureParams.create_from_hef(
             hef,
-            interface=HailoStreamInterface.PCIe,  # M.2 su Pi in genere è PCIe
+            interface=HailoStreamInterface.PCIe,
         )
         network_groups = target.configure(hef, cfg_params)
         network_group = network_groups[0]
@@ -125,66 +85,57 @@ def main():
              OutputVStreams(network_group, output_vstreams_params) as out_streams, \
              network_group.activate(network_group_params):
 
-            print("Inferenza modello custom avviata. Premi 'q' per uscire.")
-
-            # opzionale: stampa info sugli stream
-            print("--- Input streams ---")
-            for s in in_streams:
-                print("  ", s.name)
-            print("--- Output streams ---")
-            for s in out_streams:
-                print("  ", s.name)
+            print("Classificazione avviata. Premi 'q' per uscire.")
 
             while True:
-                # Frame dalla camera (RGB)
+                # frame RGB uint8 0–255
                 frame_rgb = picam.capture_array()
 
-                # Il modello si aspetta (1, H, W, C) uint8
-                input_tensor = np.expand_dims(frame_rgb, axis=0).astype(np.uint8)
+                # niente /255 qui: lo fa il layer Rescaling nel modello
+                network_input = frame_rgb.astype(np.uint8)
+                input_tensor = np.expand_dims(network_input, axis=0)
 
-                # manda l'input a tutti gli stream (in genere 1)
+                # invio all'inference
                 for s in in_streams:
                     s.send(input_tensor)
 
-                # raccogli tutti i tensori di output
+                # lettura output
                 outputs = []
                 for s in out_streams:
-                    out = s.recv()
-                    outputs.append(out)
+                    outputs.append(s.recv())
 
-                # Se hai un solo tensore di detection:
-                dets_tensor = outputs[0]
+                logits = outputs[0]       # shape (3,)
 
-                # decodifica le detection in bbox + label + score
-                detections = decode_detections(
-                    dets_tensor,
-                    img_w=in_w,
-                    img_h=in_h,
-                    score_thresh=THRESH,
-                )
+                class_id, label, score, probs = classify(logits)
 
-                # frame_bgr per disegnare con OpenCV
+                # visualizzazione
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-                # disegna le box
-                for det in detections:
-                    x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
-                    score = det["score"]
-                    label = det["label"]
+                text_main = f"Pred: {label} ({class_id})  {score:.2f}"
+                cv2.putText(
+                    frame_bgr,
+                    text_main,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
 
-                    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    text = f"{label} {score:.2f}"
+                for i, p in enumerate(probs):
+                    cname = CLASS_NAMES[i]
+                    line = f"{i}: {cname} -> {p:.2f}"
                     cv2.putText(
                         frame_bgr,
-                        text,
-                        (x1, max(0, y1 - 5)),
+                        line,
+                        (10, 60 + 25 * i),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0),
+                        0.6,
+                        (255, 255, 255),
                         1,
                     )
 
-                cv2.imshow("Modello custom Hailo - preview", frame_bgr)
+                cv2.imshow("Circle / Square / Triangle - Hailo", frame_bgr)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
