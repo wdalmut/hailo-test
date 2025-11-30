@@ -14,7 +14,7 @@ from hailo_platform import (
     HailoStreamInterface,
 )
 
-HEF_PATH = "/home/pi/hailo-test/model_h8l.hef"
+HEF_PATH = "/home/pi/hailo-test/hef/shapes224.hef"
 IMG_SIZE = 224
 CLASS_NAMES = ["circle", "square", "triangle"]
 
